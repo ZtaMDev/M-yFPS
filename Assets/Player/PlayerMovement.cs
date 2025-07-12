@@ -1,49 +1,99 @@
 using UnityEngine;
 
-[RequireComponent(typeof(Rigidbody))]
+[RequireComponent(typeof(Rigidbody), typeof(CapsuleCollider))]
 public class PlayerMovement : MonoBehaviour
 {
+   [Header("Movement")]
+    [Tooltip("Velocidad normal al caminar.")]
     public float moveSpeed = 5f;
+
+    [Tooltip("Velocidad durante el sprint táctico.")]
+    public float sprintTacticalSpeed = 8f;
+
+    [Tooltip("Fuerza del salto vertical.")]
     public float jumpForce = 6f;
+
+    [Header("Sprint Táctico")]
+    [Tooltip("Duración máxima del sprint táctico en segundos.")]
+    public float sprintMaxDuration = 3f;
+
+    [Tooltip("Velocidad de recarga de energía para el sprint táctico.")]
+    public float sprintRechargeRate = 1.5f;
+
+    [Tooltip("Si está activo, el sprint táctico se activa automáticamente cuando hay energía.")]
+    public bool sprintAutoEnabled = false;
+
+    [Tooltip("Tiempo actual disponible para el sprint táctico.")]
+    public float sprintTimer = 0f;
+
+    // Estado interno (oculto)
+    private bool sprintDrained = false;
+    private bool isSprintingTactical = false;
+
+    [Header("Slide")]
+    [Tooltip("Velocidad durante el deslizamiento.")]
     public float slideSpeed = 10f;
+
+    [Tooltip("Duración máxima del slide en segundos.")]
     public float slideDuration = 0.5f;
-    public float recoveryDuration = 0.1f;
+
+    [Tooltip("Tiempo de enfriamiento entre slides.")]
+    public float slideCooldown = 0.3f;
+
+    // Estado interno
+    private float slideTimer, slideCooldownTimer;
+
+    [Header("Dropshot")]
+    [Tooltip("Impulso vertical inicial al hacer dropshot.")]
+    public float dropshotUpwardImpulse = 4f;
+
+    [Tooltip("Multiplicador de velocidad hacia adelante durante dropshot.")]
+    public float dropshotForwardMultiplier = 0.85f;
+
+    [Header("Crouch")]
+    [Tooltip("Altura del collider en posición de crouch.")]
+    public float crouchHeight = 1f;
+
+    [Tooltip("Ajuste de centro del collider al agacharse.")]
+    public Vector3 crouchCenterOffset = new Vector3(0f, -0.5f, 0f);
+
+    [Header("Camera")]
+    [Tooltip("Referencia al transform del holder de cámara.")]
+    public Transform cameraHolder;
+
+    [Tooltip("Offset de cámara durante slide.")]
+    public Vector3 slideCameraOffset = new Vector3(0f, -0.5f, 0f);
+
+    [Tooltip("Offset de cámara durante dropshot.")]
+    public Vector3 dropshotCameraOffset = new Vector3(0f, -1.5f, -0.3f);
+
+    [Tooltip("Velocidad de transición de la cámara.")]
+    public float cameraTransitionSpeed = 6f;
+
+    [Header("Air Control")]
+    [Tooltip("Control de movimiento en aire si el jugador no tiene impulso.")]
+    public float airControlMultiplierFromIdle = 0.2f;
+
+    // Internos
+    private bool justCancelledAction = false;
+    private bool awaitingAirDirection = false, airDirectionLocked = false;
+    private Vector3 airMomentum = Vector3.zero;
+
+    private enum State { Normal, Crouch, Slide, Dropshot }
+    private State currentState = State.Normal;
 
     private Rigidbody rb;
-    private bool isGrounded;
-    private bool isSliding = false;
-    private bool isRecovering = false;
-    private bool isCrouching = false;
-    private float slideTimer = 0f;
-    private float recoveryTimer = 0f;
-    private bool cPressedDuringSlide = false;
-
-    private Vector3 slideDirection;
-    private Vector3 momentum;
-
-    public Transform cameraHolder;
-    private Vector3 originalCameraPos;
-    public Vector3 slideCameraOffset = new Vector3(0f, -0.5f, 0f);
-    public float cameraTransitionSpeed = 6f;
-    private bool justCancelledWithSpace = false;
-    private Vector3 airMomentum = Vector3.zero;
-    private bool awaitingAirDirection = false;
-    private bool airDirectionLocked = false;
-    public float airControlMultiplierFromIdle = 0.2f;
     private CapsuleCollider capsule;
     private float originalHeight;
-    private Vector3 originalCenter;
-    public float crouchHeight = 1f;
-    public Vector3 crouchCenterOffset = new Vector3(0f, -0.5f, 0f);
-    public float slideCooldown = 0.3f;
-    private float slideCooldownTimer = 0f;
-    public float crouchSpeedMultiplier = 0.5f; // ajusta entre 0.1 y 1.0
+    private Vector3 originalCenter, originalCameraPos;
 
 
     void Start()
     {
         rb = GetComponent<Rigidbody>();
         capsule = GetComponent<CapsuleCollider>();
+        sprintTimer = sprintMaxDuration; // inicia lleno
+
         originalHeight = capsule.height;
         originalCenter = capsule.center;
         originalCameraPos = cameraHolder.localPosition;
@@ -51,252 +101,399 @@ public class PlayerMovement : MonoBehaviour
 
     void Update()
     {
-        HandleSlide();
-        HandleCrouch();
-        Jump();
+        // 1) Tiempo de cooldown para nuevos slides
+        if (slideCooldownTimer > 0f) slideCooldownTimer -= Time.deltaTime;
+        
+        // 2) Entradas
+        HandleSlideInput();
+        HandleCrouchAndDropshotInput();
+        HandleJumpInput();
         TransitionCamera();
-
-        if (awaitingAirDirection && !isGrounded && !airDirectionLocked)
+        HandleSprintTactical();
+        // 3) Aire (post-jump)
+        if (awaitingAirDirection && !IsGrounded() && !airDirectionLocked)
         {
-            float moveX = Input.GetAxisRaw("Horizontal");
-            float moveZ = Input.GetAxisRaw("Vertical");
-            Vector3 inputDirection = (transform.right * moveX + transform.forward * moveZ).normalized;
-
-            if (inputDirection != Vector3.zero)
+            float mx = Input.GetAxisRaw("Horizontal");
+            float mz = Input.GetAxisRaw("Vertical");
+            Vector3 dir = (transform.right * mx + transform.forward * mz).normalized;
+            if (dir != Vector3.zero)
             {
-                airMomentum = inputDirection * moveSpeed;
+                airMomentum = dir * moveSpeed;
                 airDirectionLocked = true;
                 awaitingAirDirection = false;
             }
         }
-        
-        if (slideCooldownTimer > 0f)
-        {
-            slideCooldownTimer -= Time.deltaTime;
-        }
-
     }
 
     void FixedUpdate()
     {
-        Move();
+        ApplyMovement();
     }
 
-    void Move()
+    // ————————————————————————————————————————————————————————————————————————
+    // 1) MOVE & AIR CONTROL
+    void ApplyMovement()
     {
-        if (isSliding) return;
+        // no sobreescribir durante slide o dropshot
+        if (currentState == State.Slide || currentState == State.Dropshot) return;
 
-        Vector3 velocity;
+        Vector3 vel = rb.velocity;
 
-        if (isGrounded)
+        if (IsGrounded())
         {
-            float moveX = Input.GetAxis("Horizontal");
-            float moveZ = Input.GetAxis("Vertical");
-            Vector3 moveInput = transform.right * moveX + transform.forward * moveZ;
+            float mx = Input.GetAxis("Horizontal");
+            float mz = Input.GetAxis("Vertical");
+            Vector3 inputDir = (transform.right * mx + transform.forward * mz).normalized;
 
-            float currentSpeed = moveSpeed;
-            if (isRecovering) currentSpeed *= crouchSpeedMultiplier;
-            if (isCrouching) currentSpeed *= crouchSpeedMultiplier;
+            float speed = moveSpeed;
 
-            velocity = new Vector3(moveInput.x * currentSpeed, rb.velocity.y, moveInput.z * currentSpeed);
-            momentum = moveInput.normalized * currentSpeed;
+            if (currentState == State.Crouch) speed *= 0.5f;
+            else if (isSprintingTactical && currentState == State.Normal)
+                speed = sprintTacticalSpeed;
+
+            vel.x = inputDir.x * speed;
+            vel.z = inputDir.z * speed;
+            // guardamos momentum para cancelar slide
+            airMomentum = inputDir * speed;
         }
         else
         {
-            Vector3 airMoveInput = Vector3.zero;
-            if (airMomentum == Vector3.zero)
+            Vector3 correction = Vector3.zero;
+            if (airDirectionLocked == false)
             {
-                float moveX = Input.GetAxis("Horizontal");
-                float moveZ = Input.GetAxis("Vertical");
-                airMoveInput = (transform.right * moveX + transform.forward * moveZ).normalized * moveSpeed * airControlMultiplierFromIdle;
+                float mx = Input.GetAxis("Horizontal");
+                float mz = Input.GetAxis("Vertical");
+                Vector3 inAirDir = (transform.right * mx + transform.forward * mz).normalized;
+                correction = inAirDir * moveSpeed * airControlMultiplierFromIdle;
             }
-
-            Vector3 combinedAir = airMomentum + airMoveInput;
-            velocity = new Vector3(combinedAir.x, rb.velocity.y, combinedAir.z);
+            Vector3 combined = airMomentum + correction;
+            vel.x = combined.x;
+            vel.z = combined.z;
         }
 
-        rb.velocity = velocity;
+        rb.velocity = vel;
     }
-
-    void Jump()
+    void HandleSprintTactical()
     {
-        if (justCancelledWithSpace)
+        float mx = Input.GetAxisRaw("Horizontal");
+        float mz = Input.GetAxisRaw("Vertical");
+        bool isMoving = new Vector3(mx, 0f, mz).magnitude > 0.1f;
+        bool shiftHeld = Input.GetKey(KeyCode.LeftShift);
+        bool cancelledSlide = Input.GetKeyDown(KeyCode.Space) && currentState == State.Slide;
+
+        // ¿Está pidiendo sprint?
+        bool sprintRequest = (shiftHeld || sprintAutoEnabled) 
+                            && currentState == State.Normal 
+                            && isMoving;
+
+        // 1) Si estamos drenados, recarga hasta full y reactiva sólo si se sigue pidiendo
+        if (sprintDrained)
         {
-            justCancelledWithSpace = false;
+            sprintTimer += Time.deltaTime * sprintRechargeRate;
+            if (sprintTimer >= sprintMaxDuration)
+            {
+                sprintTimer = sprintMaxDuration;
+                sprintDrained = false;
+                if (sprintRequest) 
+                    isSprintingTactical = true;
+            }
             return;
         }
 
-        if (Input.GetKeyDown(KeyCode.Space) && isGrounded && !isSliding)
+        // 2) Si estamos esprintando, gastar o detener
+        if (isSprintingTactical)
         {
-            if (isCrouching)
+            if (!sprintRequest)
             {
-                CancelCrouch();
-                return;
-            }
-
-            float moveX = Input.GetAxis("Horizontal");
-            float moveZ = Input.GetAxis("Vertical");
-            Vector3 directionalInput = (transform.right * moveX + transform.forward * moveZ).normalized;
-
-            if (directionalInput == Vector3.zero)
-            {
-                awaitingAirDirection = true;
-                airDirectionLocked = false;
-                airMomentum = Vector3.zero;
+                // soltó Shift / no quiere auto sprint → detenemos
+                isSprintingTactical = false;
             }
             else
             {
-                airMomentum = directionalInput * moveSpeed;
-                airDirectionLocked = true;
-                awaitingAirDirection = false;
-            }
-
-            Vector3 jumpVelocity = airMomentum + Vector3.up * jumpForce;
-            rb.velocity = jumpVelocity;
-        }
-    }
-
-    void HandleSlide()
-    {
-        if (Input.GetKeyDown(KeyCode.C))
-        {
-            if (!isSliding && isGrounded)
-            {
-                bool isMoving = Mathf.Abs(Input.GetAxis("Horizontal")) > 0.1f || Mathf.Abs(Input.GetAxis("Vertical")) > 0.1f;
-
-                if (isMoving && !isCrouching)
+                // sigue esprintando → drenamos
+                sprintTimer -= Time.deltaTime;
+                if (sprintTimer <= 0f)
                 {
-                    StartSlide();
+                    sprintTimer = 0f;
+                    isSprintingTactical = false;
+                    sprintDrained = true;  // marcamos drenado
                 }
             }
-            else if (isSliding)
+            return;
+        }
+
+        // 3) Si no estamos esprintando y hay energía + petición → arrancamos sprint
+        if (sprintRequest && sprintTimer > 0f)
+        {
+            isSprintingTactical = true;
+            return;
+        }
+
+        // 4) Recarga incidental (quieto, caminar, slide, dropshot, cancel slide)
+        if (!isMoving 
+            || cancelledSlide 
+            || currentState == State.Slide 
+            || currentState == State.Dropshot)
+        {
+            sprintTimer += Time.deltaTime * sprintRechargeRate;
+            if (sprintTimer > sprintMaxDuration)
+                sprintTimer = sprintMaxDuration;
+        }
+    }
+    // ————————————————————————————————————————————————————————————————————————
+    // 2) SLIDE
+    void HandleSlideInput()
+    {
+        if (currentState == State.Dropshot && !IsGrounded())
+        {
+            return;
+        }
+
+        // C para slide / cancel slide / cancel crouch
+        if (Input.GetKeyDown(KeyCode.C) && IsGrounded())
+        {
+            // START SLIDE
+            if (currentState == State.Normal && slideCooldownTimer <= 0f && isSprintingTactical)
             {
-                cPressedDuringSlide = true;
+                float moveX = Input.GetAxis("Horizontal"), moveZ = Input.GetAxis("Vertical");
+                Vector3 dir = (transform.right * moveX + transform.forward * moveZ).normalized;
+                if (dir.magnitude > 0.1f)
+                    StartSlide(dir);
             }
-            else if (isCrouching)
+            // CANCEL SLIDE PREMATURELY
+            else if (currentState == State.Slide)
+            {
+                CancelSlide();
+            }
+            // CANCEL CROUCH
+            else if (currentState == State.Crouch)
             {
                 CancelCrouch();
             }
         }
 
-        if (isSliding && Input.GetKeyDown(KeyCode.Space))
+        // SPACE cancela slide (1ª) y bloquea salto, luego 2ª SPACE salta
+        if (currentState == State.Slide && Input.GetKeyDown(KeyCode.Space))
         {
-            cPressedDuringSlide = true;
-            justCancelledWithSpace = true;
+            CancelSlide();
+            justCancelledAction = true;
         }
 
-        if (isSliding)
+        // timer interno de slide
+        if (currentState == State.Slide)
         {
             slideTimer -= Time.deltaTime;
 
-            // 💡 Nuevo: chequeo por velocidad baja antes de que termine slideTimer
+            // 🚦 Detectar si la velocidad ya es baja y terminar slide automáticamente
             float horizontalSpeed = new Vector3(rb.velocity.x, 0f, rb.velocity.z).magnitude;
-            if (horizontalSpeed <= 1f && slideTimer > 0f && !cPressedDuringSlide)
+            if (horizontalSpeed <= 1f || slideTimer <= 0f)
             {
-                EndSlide(false); // activa crouch anticipado si no se canceló
-                return;
-            }
-
-            if (slideTimer <= 0f || cPressedDuringSlide)
-            {
-                EndSlide(cPressedDuringSlide);
+                EndSlide();
             }
         }
 
-
-        if (isRecovering)
-        {
-            recoveryTimer -= Time.deltaTime;
-            if (recoveryTimer <= 0f) isRecovering = false;
-        }
     }
 
-    void StartSlide()
+    void StartSlide(Vector3 dir)
     {
-        if (slideCooldownTimer > 0f) return; // bloquea slide si está en cooldown
-        isSliding = true;
+        currentState = State.Slide;
         slideTimer = slideDuration;
-        slideCooldownTimer = slideCooldown; // arranca cooldown
-        cPressedDuringSlide = false;
+        slideCooldownTimer = slideCooldown;
 
-        float moveX = Input.GetAxis("Horizontal");
-        float moveZ = Input.GetAxis("Vertical");
-        Vector3 moveInput = transform.right * moveX + transform.forward * moveZ;
-        slideDirection = moveInput.normalized;
-        if (slideDirection == Vector3.zero) slideDirection = transform.forward;
-
-        rb.velocity = slideDirection * slideSpeed;
         capsule.height = crouchHeight;
         capsule.center = originalCenter + crouchCenterOffset;
-        isCrouching = false;
+
+        rb.velocity = dir * slideSpeed;
     }
 
-    void EndSlide(bool cancelled)
+    void CancelSlide()
     {
-        isSliding = false;
-        isRecovering = true;
-        recoveryTimer = recoveryDuration;
-        cPressedDuringSlide = false;
+        currentState = State.Normal;
+        capsule.height = originalHeight;
+        capsule.center = originalCenter;
+        // devolvemos momentum de movimiento
+        rb.velocity = airMomentum;
+    }
 
-        if (cancelled)
-        {
-            rb.velocity = momentum;
-            CancelCrouch();
-        }
-        else
-        {
-            // Primero activamos crouch, luego reducimos la velocidad
-            isCrouching = true;
-            capsule.height = crouchHeight;
-            capsule.center = originalCenter + crouchCenterOffset;
+    void EndSlide()
+    {
+        currentState = State.Normal;
+        capsule.height = originalHeight;
+        capsule.center = originalCenter;
 
-            rb.velocity = slideDirection * (slideSpeed * 0.5f);
-        }
+        Vector3 horizontalDir = new Vector3(rb.velocity.x, 0f, rb.velocity.z).normalized;
+        rb.velocity = horizontalDir * moveSpeed; // ↔ retomar velocidad normal suavemente
     }
 
 
-    void HandleCrouch()
+
+    // ————————————————————————————————————————————————————————————————————————
+    // 3) CROUCH Y DROPSHOT
+    void HandleCrouchAndDropshotInput()
     {
-        if (!isGrounded) return; // no hacer nada si estás en el aire
+        if (!IsGrounded()) return;
 
         if (Input.GetKeyDown(KeyCode.LeftControl))
         {
-            if (isSliding) return; // no permitir crouch mientras estás deslizando
+            float mx = Input.GetAxis("Horizontal"), mz = Input.GetAxis("Vertical");
+            Vector3 dir = (transform.right * mx + transform.forward * mz).normalized;
+            bool moving = dir.magnitude > 0.1f;
 
-            if (isCrouching)
+            // si está en Slide, no hacemos nada
+            if (currentState == State.Slide) return;
+
+            // START DROPSHOT
+            if (moving && currentState == State.Normal && isSprintingTactical)
+            {
+                StartDropshot(dir);
+            }
+            // TOGGLE CROUCH
+            else if (currentState == State.Crouch)
             {
                 CancelCrouch();
             }
-            else
+            else if (currentState == State.Normal)
             {
-                capsule.height = crouchHeight;
-                capsule.center = originalCenter + crouchCenterOffset;
-                isCrouching = true;
+                EnterCrouch();
             }
         }
+
+        // SPACE cancela dropshot (1ª) → vuelve a Normal, luego 2ª SPACE salta
+        if (currentState == State.Dropshot && Input.GetKeyDown(KeyCode.Space))
+        {
+            if (IsGrounded()) // 👈 solo permite cancelar cuando está en el piso
+            {
+                CancelDropshot();
+                justCancelledAction = true;
+            }
+        }
+
+    }
+
+    void EnterCrouch()
+    {
+        currentState = State.Crouch;
+        capsule.height = crouchHeight;
+        capsule.center = originalCenter + crouchCenterOffset;
+        rb.velocity = Vector3.zero;
     }
 
     void CancelCrouch()
     {
+        currentState = State.Normal;
         capsule.height = originalHeight;
         capsule.center = originalCenter;
-        isCrouching = false;
     }
 
+    void StartDropshot(Vector3 dir)
+    {
+        currentState = State.Dropshot;
+
+        capsule.height = crouchHeight;
+        capsule.center = originalCenter + crouchCenterOffset;
+
+        // impulso: adelante + un boost hacia arriba
+        Vector3 up = Vector3.up * dropshotUpwardImpulse;
+        Vector3 forward = dir * (moveSpeed * dropshotForwardMultiplier);
+        rb.velocity = forward + up;
+    }
+
+    void CancelDropshot()
+    {
+        currentState = State.Normal;
+        capsule.height = originalHeight;
+        capsule.center = originalCenter;
+    }
+
+    // ————————————————————————————————————————————————————————————————————————
+    // 4) SALTO (UNIFICADO SLIDE + DROPSHOT CANCEL)
+    void HandleJumpInput()
+    {
+         // ── 0) Bloquear salto/cancel mientras estés en Dropshot y AÚN en el aire
+        if (currentState == State.Dropshot && !IsGrounded())
+            return;
+        // espacio: cancelar estado si estamos en Slide/Crouch/Dropshot
+        // y bloquear salto UNA SOLA VEZ
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            // 1ª prioridad: Cancelar Slide
+            if (currentState == State.Slide)
+            {
+                CancelSlide();
+                justCancelledAction = true;
+                return;
+            }
+
+            // 2ª prioridad: Cancelar Dropshot
+            if (currentState == State.Dropshot)
+            {
+                CancelDropshot();
+                justCancelledAction = true;
+                return;
+            }
+
+            // 3ª prioridad: Cancelar Crouch
+            if (currentState == State.Crouch)
+            {
+                CancelCrouch();
+                justCancelledAction = true;
+                return;
+            }
+
+            // 4ª: Si estamos en Normal y en piso, saltar (respetando cancel)
+            if (IsGrounded() && !justCancelledAction)
+            {
+                float mx = Input.GetAxis("Horizontal");
+                float mz = Input.GetAxis("Vertical");
+                Vector3 dir = (transform.right * mx + transform.forward * mz).normalized;
+
+                if (dir == Vector3.zero)
+                {
+                    awaitingAirDirection = true;
+                    airDirectionLocked = false;
+                    airMomentum = Vector3.zero;
+                }
+                else
+                {
+                    awaitingAirDirection = false;
+                    airDirectionLocked = true;
+                    airMomentum = dir * moveSpeed;
+                }
+
+                rb.velocity = airMomentum + Vector3.up * jumpForce;
+            }
+
+            // limpiamos flag si ya se canceló
+            if (justCancelledAction) justCancelledAction = false;
+        }
+    }
+
+    // ————————————————————————————————————————————————————————————————————————
+    // 5) CÁMARA
     void TransitionCamera()
     {
-        bool lowered = isSliding || isCrouching;
-        Vector3 targetPos = lowered ? originalCameraPos + slideCameraOffset : originalCameraPos;
-        cameraHolder.localPosition = Vector3.Lerp(cameraHolder.localPosition, targetPos, Time.deltaTime * cameraTransitionSpeed);
+        bool lowered = currentState == State.Crouch
+                    || currentState == State.Slide
+                    || currentState == State.Dropshot;
+
+        Vector3 offset = currentState == State.Dropshot
+                       ? dropshotCameraOffset
+                       : slideCameraOffset;
+
+        Vector3 target = lowered
+            ? originalCameraPos + offset
+            : originalCameraPos;
+
+        cameraHolder.localPosition =
+            Vector3.Lerp(cameraHolder.localPosition, target,
+                         Time.deltaTime * cameraTransitionSpeed);
     }
 
-    void OnCollisionStay(Collision collision)
+    // ————————————————————————————————————————————————————————————————————————
+    // GROUND CHECK
+    private bool IsGrounded()
     {
-        isGrounded = true;
-    }
-
-    void OnCollisionExit(Collision collision)
-    {
-        isGrounded = false;
+        // Tú usabas OnCollisionStay/Exit; aquí lo simplifico:
+        return Physics.Raycast(transform.position, Vector3.down, 1.1f);
     }
 }
